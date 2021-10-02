@@ -1,3 +1,3 @@
 tasks:
-        - before: brew install llvm && wget https://github.com/mozilla/sccache/releases/download/v0.2.15/sccache-v0.2.15-x86_64-unknown-linux-musl.tar.gz && tar xfz sccache-v0.2.15-x86_64-unknown-linux-musl.tar.gz && cp sccache-v0.2.15-x86_64-unknown-linux-musl/sccache $HOME/.cargo/bin/ && chmod +x $HOME/.cargo/bin/sccache
+        - before: brew install llvm && wget https://github.com/mozilla/sccache/releases/download/v0.2.15/sccache-v0.2.15-x86_64-unknown-linux-musl.tar.gz && tar xfz sccache-v0.2.15-x86_64-unknown-linux-musl.tar.gz && cp sccache-v0.2.15-x86_64-unknown-linux-musl/sccache $HOME/.cargo/bin/ && chmod +x $HOME/.cargo/bin/sccache && rm -rf sccache-*
           command: ./configure && RUSTC_WRAPPER=sccache /usr/bin/time -f %e python x.py build && /usr/bin/time -f %e python x.py install
