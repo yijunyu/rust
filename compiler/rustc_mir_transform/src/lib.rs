@@ -42,6 +42,7 @@ use std::sync::LazyLock;
 
 use pass_manager::{self as pm, Lint, MirLint, MirPass, WithMinOptLevel};
 
+pub mod dead_fn_elim;
 mod check_pointers;
 mod cost_checker;
 mod cross_crate_inline;

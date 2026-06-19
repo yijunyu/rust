@@ -17,7 +17,7 @@ use rustc_span::ErrorGuaranteed;
 mod collector;
 mod errors;
 mod mono_checks;
-mod partitioning;
+pub mod partitioning;
 mod util;
 
 rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

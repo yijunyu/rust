@@ -1109,6 +1109,14 @@ where
     }
 }
 
+/// Public shim for `-Z dead-fn-elimination` in `rustc_driver_impl`.
+/// Calls the real `collect_and_partition_mono_items` so the CGU filter can delegate
+/// to the upstream implementation without infinite recursion via the query system.
+#[allow(dead_code, unreachable_pub)]
+pub fn collect_and_partition_mono_items_impl(tcx: TyCtxt<'_>, (): ()) -> MonoItemPartitions<'_> {
+    collect_and_partition_mono_items(tcx, ())
+}
+
 fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> MonoItemPartitions<'_> {
     let collection_strategy = if tcx.sess.link_dead_code() {
         MonoItemCollectionStrategy::Eager

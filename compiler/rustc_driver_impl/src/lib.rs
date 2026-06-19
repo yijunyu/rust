@@ -273,6 +273,14 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
 
     callbacks.config(&mut config);
 
+    // Register CGU filter for -Z dead-fn-elimination (query override, function pointer).
+    // The BFS analysis runs in after_analysis (below) and populates thread-local state.
+    // The CGU filter reads that state when collect_and_partition_mono_items is called
+    // during codegen (which happens after after_analysis).
+    if config.opts.unstable_opts.dead_fn_elimination && config.override_queries.is_none() {
+        config.override_queries = Some(dead_fn_elim_override_queries);
+    }
+
     let registered_lints = config.register_lints.is_some();
 
     interface::run_compiler(config, |compiler| {
@@ -373,6 +381,13 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
                 dump_feature_usage_metrics(tcx, metrics_dir);
             }
 
+            // -Z dead-fn-elimination: BFS reachability analysis.
+            // Populates thread-local ELIMINABLE_DEF_IDS, read by the CGU filter
+            // registered above via override_queries.
+            if tcx.sess.opts.unstable_opts.dead_fn_elimination {
+                rustc_mir_transform::dead_fn_elim::run_analysis(tcx);
+            }
+
             if callbacks.after_analysis(compiler, tcx) == Compilation::Stop {
                 return early_exit();
             }
@@ -392,6 +407,30 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
             linker.link(sess, codegen_backend);
         }
     })
+}
+
+/// `override_queries` hook for `-Z dead-fn-elimination`.
+/// Overrides `is_codegened_item` to exclude BFS-unreachable functions.
+/// Named function (not closure) so it fits in `Config::override_queries: Option<fn(...)>`.
+fn dead_fn_elim_override_queries(
+    _sess: &rustc_session::Session,
+    providers: &mut rustc_middle::util::Providers,
+) {
+    providers.queries.is_codegened_item = dead_fn_elim_is_codegened_item;
+}
+
+/// Returns `false` for functions identified as unreachable by `-Z dead-fn-elimination`,
+/// suppressing codegen for those functions.
+fn dead_fn_elim_is_codegened_item(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) -> bool {
+    // Short-circuit: if this is a local item we've identified as eliminable, skip it.
+    if def_id.is_local() {
+        let idx = def_id.index.as_u32() as u64;
+        if rustc_mir_transform::dead_fn_elim::is_eliminable(idx) {
+            return false;
+        }
+    }
+    // Otherwise fall back to the standard provider (checks all_mono_items).
+    tcx.collect_and_partition_mono_items(()).all_mono_items.contains(&def_id)
 }
 
 fn dump_feature_usage_metrics(tcxt: TyCtxt<'_>, metrics_dir: &Path) {
