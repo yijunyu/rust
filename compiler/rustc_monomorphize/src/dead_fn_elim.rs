@@ -57,24 +57,47 @@ pub(crate) fn run_analysis(tcx: TyCtxt<'_>, mono_items: &[MonoItem<'_>]) {
     // unblocks Cargo to compile the downstream binary via pipelining. If `-Zdead-fn-wait-used-
     // set=N` is set, block here up to N seconds for that binary's frontend to produce the
     // used-set — so this library's frontend runs once and only its (pruned) codegen is deferred.
-    if let (Some(path), Some(secs)) = (
-        tcx.sess.opts.unstable_opts.dead_fn_used_set.as_deref(),
-        tcx.sess.opts.unstable_opts.dead_fn_wait_used_set,
-    ) && !path.exists()
+    // Per-crate completeness marker. A crate's used-set is *appended to* by every probe that calls
+    // it; the LAST appender is always the binary's probe, which runs the monomorphization collector
+    // (the only pass that sees functions reached purely through generic instantiation). When that
+    // probe finishes it atomically creates `<crate>.done`. So the used-set is complete iff the
+    // marker exists. We wait a bounded time for it, then decide:
+    //   - marker present  → the used-set is complete; prune against it.
+    //   - marker absent   → the binary probe has not finished (or there is none); do NOT prune —
+    //                       keep the full public closure. This is sound (over-keeps) and, crucially,
+    //                       never blocks a job indefinitely, so it cannot deadlock Cargo's job pool
+    //                       the way a global "wait for all N probes" barrier does.
+    let done_marker = tcx.sess.opts.unstable_opts.dead_fn_used_set.as_deref().map(|p| {
+        let mut d = p.to_path_buf();
+        d.set_extension("done");
+        d
+    });
+    let mut used_set_complete = true;
+    if let (Some(done), Some(secs)) =
+        (done_marker.as_deref(), tcx.sess.opts.unstable_opts.dead_fn_wait_used_set)
+        && !done.exists()
     {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs as u64);
-        while !path.exists() && std::time::Instant::now() < deadline {
+        while !done.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        used_set_complete = done.exists();
     }
 
-    let used_set = tcx
-        .sess
-        .opts
-        .unstable_opts
-        .dead_fn_used_set
-        .as_deref()
-        .and_then(|p| crate::used_set::UsedSet::load(tcx, p));
+    let used_set = if used_set_complete {
+        tcx.sess
+            .opts
+            .unstable_opts
+            .dead_fn_used_set
+            .as_deref()
+            .and_then(|p| crate::used_set::UsedSet::load(tcx, p))
+    } else {
+        tcx.sess.dcx().note(
+            "-Z dead-fn-elimination: used-set completeness marker absent before deadline; \
+             keeping full public closure (no pruning) for soundness",
+        );
+        None
+    };
 
     // Without a used-set, the pass is binary-only: skip library crates entirely. A binary's
     // collector is already exact, so there is nothing to eliminate there without a used-set,
@@ -191,10 +214,27 @@ fn collect_seeds(tcx: TyCtxt<'_>, used_set: Option<&crate::used_set::UsedSet>) -
     // slice. See `compiler/rustc_passes/src/reachable.rs`.
     let reachable_set = tcx.reachable_set(());
     for &local_def_id in tcx.mir_keys(()) {
+        let def_id = local_def_id.to_def_id();
         if !reachable_set.contains(&local_def_id) {
+            // Not cross-crate reachable (private / `pub(crate)` / closures). The used-set speaks
+            // only to a crate's *exported* surface — which of its `pub` functions a downstream
+            // binary calls. It says nothing about a crate's internal functions, so we must not
+            // let it drop them: in the cross-crate case the local collector's ground truth is
+            // discarded (`mono_def_ids` is empty), so the only thing keeping an internal helper
+            // alive is the intra-crate BFS, and that BFS can miss edges (e.g. a call inside a
+            // closure passed to a generic adaptor: `iter.map(|x| x.name_no_brackets())`). Seed
+            // every internal fn-like item unconditionally: keeping the crate's private closure is
+            // sound and cheap; the win is dropping the unused *exported* API, which we still do.
+            if used_set.is_some()
+                && matches!(
+                    tcx.def_kind(def_id),
+                    DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+                )
+            {
+                seeds.insert(def_id_key(def_id));
+            }
             continue;
         }
-        let def_id = local_def_id.to_def_id();
         // Cross-crate: a free `pub fn` in `reachable_set` only by visibility becomes a
         // *candidate* for elimination when the binary does not use it — so do not seed it.
         // Soundness is still enforced downstream by `is_safe_to_eliminate` (keeps linker-
@@ -208,9 +248,20 @@ fn collect_seeds(tcx: TyCtxt<'_>, used_set: Option<&crate::used_set::UsedSet>) -
         // trait-impl method is the conservative, sound floor for cross-crate elimination.
         let is_trait_impl_method = tcx.def_kind(def_id) == DefKind::AssocFn
             && tcx.associated_item(def_id).trait_item_def_id().is_some();
+        // Eliminable kinds: free functions and *inherent* methods (`Socket::bind` etc.) —
+        // a broad crate's real surface. Trait-impl methods are excluded by the guard below.
+        let is_eliminable_kind = matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn);
+        // Only an *externally reachable* item may be eliminated by the used-set: the used-set
+        // records which of a crate's cross-crate-visible functions a downstream binary calls, and
+        // says nothing about items reachable only *within* the crate. A `pub(crate)` free function
+        // (e.g. `chrono::format::scan::colon_or_space`) can appear in `reachable_set` because it is
+        // reachable from an exported generic, yet no other crate can name it — the used-set can
+        // never list it, so it must not be a candidate (its liveness is the intra-crate BFS's job,
+        // which may miss closure/generic edges). `is_externally_reachable` gates this.
         if let Some(used) = used_set
-            && tcx.def_kind(def_id) == DefKind::Fn
+            && is_eliminable_kind
             && !is_trait_impl_method
+            && is_externally_reachable(tcx, def_id)
             && is_locally_safe_to_eliminate(tcx, def_id)
             && !used.contains(tcx, def_id)
         {
@@ -258,6 +309,14 @@ fn build_call_graph(tcx: TyCtxt<'_>) -> FxIndexMap<u64, FxIndexSet<u64>> {
         let def_kind = tcx.def_kind(def_id);
         if def_kind.is_fn_like() {
             add_mir_edges(tcx, def_id, &mut graph);
+            // Exhaustive fn-value seeding: record EVERY function whose `FnDef` appears anywhere in
+            // this body as a value (not a direct call target) into `ADDRESS_TAKEN`, so it survives
+            // regardless of how the referencing body is reached. This is the conservative floor for
+            // indirect reachability — parser-combinator libraries (`nom`'s `opt!`/`alt!`) compose
+            // sub-parsers by passing them to generic combinators through layers of closures the
+            // direct-call BFS cannot fully thread. A `pub` fn used only as a value must never be
+            // dropped; over-keeping a few such fns is sound and cheap.
+            seed_referenced_fns(tcx, def_id);
         } else if matches!(
             def_kind,
             DefKind::Const { .. } | DefKind::Static { .. } | DefKind::AssocConst { .. }
@@ -282,52 +341,161 @@ fn add_mir_edges(tcx: TyCtxt<'_>, def_id: DefId, graph: &mut FxIndexMap<u64, FxI
     if !tcx.is_mir_available(def_id) {
         return;
     }
-    let Ok(body) = panic::catch_unwind(panic::AssertUnwindSafe(|| tcx.optimized_mir(def_id)))
-    else {
-        return;
-    };
-    scan_for_address_taken(body);
+    // Build call edges from *pre-inlining* MIR when it is still available. `optimized_mir` runs
+    // the MIR inliner, which folds small callees into their callers and deletes the `Call` that
+    // named them — so a kept function's private helper (e.g. `Command::print_help` ->
+    // `_copy_subtree_for_help`) would have no edge, the BFS would not reach it, and it would be
+    // wrongly pruned even though it is still emitted as a standalone symbol. The drops-elaborated
+    // body preserves every call. It is a `Steal`; if already consumed, fall back to
+    // `optimized_mir` (only for local defs — extern defs have no drops-elaborated query here).
     let caller_key = def_id_key(def_id);
-    let edges = graph.entry(caller_key).or_default();
-    for bb in body.basic_blocks.iter() {
-        // Direct call edges.
-        if let TerminatorKind::Call { func, .. } = &bb.terminator().kind {
-            if let rustc_middle::mir::Operand::Constant(c) = func {
-                if let ty::FnDef(callee_def_id, _) = c.const_.ty().kind() {
-                    edges.insert(def_id_key(*callee_def_id));
+    // Scan one body: record it for address-taken analysis and add its call/fn-value edges.
+    let mut scan = |body: &rustc_middle::mir::Body<'_>| {
+        scan_for_address_taken(body);
+        let edges = graph.entry(caller_key).or_default();
+        for bb in body.basic_blocks.iter() {
+            // Direct call edges.
+            if let TerminatorKind::Call { func, args, .. } = &bb.terminator().kind {
+                if let rustc_middle::mir::Operand::Constant(c) = func {
+                    if let ty::FnDef(callee_def_id, _) = c.const_.ty().kind() {
+                        edges.insert(def_id_key(*callee_def_id));
+                    }
+                }
+                // A function passed *as an argument* — `x.or_else(sse2::get_imp)`,
+                // `slice.sort_by(cmp)`, a `nom` combinator receiving `atom` — appears as a
+                // `FnDef` constant in the call's ARGS, not as the callee. It is invoked
+                // indirectly by the (often generic) callee, so it must survive. Add both a call
+                // graph edge *and* an address-taken seed: the edge keeps it reachable from this
+                // body, and the seed keeps it even if this body is reached only through a generic
+                // instantiation the direct-call BFS cannot fully model (nom's macro-composed
+                // parser combinators are the motivating case).
+                for arg in args.iter() {
+                    if let rustc_middle::mir::Operand::Constant(c) = &arg.node {
+                        if let ty::FnDef(fdef, _) = c.const_.ty().kind() {
+                            edges.insert(def_id_key(*fdef));
+                            ADDRESS_TAKEN.with(|a| {
+                                a.borrow_mut().insert(def_id_key(*fdef));
+                            });
+                        }
+                    }
+                }
+            }
+            // A closure/coroutine is created via an `Aggregate` rvalue and invoked later
+            // through `Fn*`/`poll`, so there is no direct `Call` to it from its creator;
+            // without this edge the closure body (and everything it calls) would be wrongly
+            // unreachable. Likewise any `FnDef` mentioned as a value (passed to an adaptor such
+            // as `iter.map(f)`) must become an edge, not only direct call targets.
+            for stmt in &bb.statements {
+                use rustc_middle::mir::{AggregateKind, Rvalue, StatementKind};
+                if let StatementKind::Assign(box (_, rvalue)) = &stmt.kind {
+                    if let Rvalue::Aggregate(box kind, _) = rvalue {
+                        match kind {
+                            AggregateKind::Closure(cdef, _)
+                            | AggregateKind::Coroutine(cdef, _)
+                            | AggregateKind::CoroutineClosure(cdef, _) => {
+                                edges.insert(def_id_key(*cdef));
+                            }
+                            _ => {}
+                        }
+                    }
+                    for op in rvalue_operands(rvalue) {
+                        if let rustc_middle::mir::Operand::Constant(c) = op {
+                            if let ty::FnDef(fdef, _) = c.const_.ty().kind() {
+                                edges.insert(def_id_key(*fdef));
+                                // Also address-taken-seed it (see the call-arg case above): a fn
+                                // used as a value survives even if this body is only generically
+                                // reachable.
+                                ADDRESS_TAKEN.with(|a| {
+                                    a.borrow_mut().insert(def_id_key(*fdef));
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
-        // A closure/coroutine is created via an `Aggregate` rvalue and invoked later
-        // through `Fn*`/`poll`, so there is no direct `Call` to it from its creator;
-        // without this edge the closure body (and everything it calls) would be wrongly
-        // unreachable. Likewise any `FnDef` mentioned as a value (passed to an adaptor such
-        // as `iter.map(f)`) must become an edge, not only direct call targets.
-        for stmt in &bb.statements {
-            use rustc_middle::mir::{AggregateKind, Rvalue, StatementKind};
-            if let StatementKind::Assign(box (_, rvalue)) = &stmt.kind {
-                // Closure / coroutine / coroutine-closure construction.
-                if let Rvalue::Aggregate(box kind, _) = rvalue {
-                    match kind {
-                        AggregateKind::Closure(cdef, _)
-                        | AggregateKind::Coroutine(cdef, _)
-                        | AggregateKind::CoroutineClosure(cdef, _) => {
-                            edges.insert(def_id_key(*cdef));
-                        }
-                        _ => {}
-                    }
+    };
+
+    // Build call edges from *pre-inlining* MIR when available. `optimized_mir` runs the MIR
+    // inliner, which folds small callees into their callers and deletes the `Call` that named
+    // them — so a kept function's private helper (e.g. `Command::print_help` ->
+    // `_copy_subtree_for_help`) would have no edge, the BFS would not reach it, and it would be
+    // wrongly pruned even though it is still emitted as a standalone symbol. The drops-elaborated
+    // body preserves every call. It is a `Steal`; if already consumed (or the def is extern), fall
+    // back to `optimized_mir`.
+    let use_pre_inline = def_id.is_local() && {
+        let local = def_id.expect_local();
+        #[allow(rustc::untracked_query_information)]
+        let ok = !tcx.mir_drops_elaborated_and_const_checked(local).is_stolen();
+        ok
+    };
+    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        if use_pre_inline {
+            scan(&tcx.mir_drops_elaborated_and_const_checked(def_id.expect_local()).borrow());
+        } else {
+            scan(tcx.optimized_mir(def_id));
+        }
+    }));
+}
+
+/// Seed `ADDRESS_TAKEN` with every function referenced *as a value* anywhere in `def_id`'s body
+/// — i.e. every `FnDef`-typed constant that is not the direct callee of its `Call`. Uses a MIR
+/// visitor so it catches all operand positions (call args, aggregate fields, closure captures,
+/// any rvalue), which is what the layered generic combinators in parser libraries need. Reads
+/// pre-inline MIR when available (the inliner can erase these references).
+fn seed_referenced_fns(tcx: TyCtxt<'_>, def_id: DefId) {
+    use rustc_middle::mir::visit::Visitor;
+
+    struct FnValueVisitor;
+    impl<'tcx> Visitor<'tcx> for FnValueVisitor {
+        // Seed every `FnDef` operand *except* the direct callee of a `Call` — that one is an
+        // ordinary direct call, handled by the call-graph edges; seeding it would keep every
+        // called function whether or not its call site is reachable (defeating elimination).
+        fn visit_terminator(
+            &mut self,
+            term: &rustc_middle::mir::Terminator<'tcx>,
+            loc: rustc_middle::mir::Location,
+        ) {
+            use rustc_middle::mir::TerminatorKind;
+            if let TerminatorKind::Call { args, .. } = &term.kind {
+                // Visit only the args (and destination/other fields) — skip `func`.
+                for arg in args.iter() {
+                    self.visit_operand(&arg.node, loc);
                 }
-                // Any operand that names a function by value (a fn item passed around).
-                for op in rvalue_operands(rvalue) {
-                    if let rustc_middle::mir::Operand::Constant(c) = op {
-                        if let ty::FnDef(fdef, _) = c.const_.ty().kind() {
-                            edges.insert(def_id_key(*fdef));
-                        }
-                    }
-                }
+            } else {
+                self.super_terminator(term, loc);
+            }
+        }
+        fn visit_const_operand(
+            &mut self,
+            c: &rustc_middle::mir::ConstOperand<'tcx>,
+            _: rustc_middle::mir::Location,
+        ) {
+            if let ty::FnDef(def_id, _) = c.const_.ty().kind() {
+                ADDRESS_TAKEN.with(|a| {
+                    a.borrow_mut().insert(def_id_key(*def_id));
+                });
             }
         }
     }
+
+    if !tcx.is_mir_available(def_id) {
+        return;
+    }
+    let use_pre_inline = def_id.is_local() && {
+        let local = def_id.expect_local();
+        #[allow(rustc::untracked_query_information)]
+        let ok = !tcx.mir_drops_elaborated_and_const_checked(local).is_stolen();
+        ok
+    };
+    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let mut v = FnValueVisitor;
+        if use_pre_inline {
+            v.visit_body(&tcx.mir_drops_elaborated_and_const_checked(def_id.expect_local()).borrow());
+        } else {
+            v.visit_body(tcx.optimized_mir(def_id));
+        }
+    }));
 }
 
 /// Best-effort iterator over the operands an `Rvalue` reads, so we can spot `FnDef` values
@@ -470,6 +638,18 @@ fn is_safe_to_eliminate(tcx: TyCtxt<'_>, def_id: DefId, mono_items: &FxHashSet<D
         return false;
     }
     is_locally_safe_to_eliminate(tcx, def_id)
+}
+
+/// Is this item reachable from *outside* the crate (effective visibility exported)? Only such
+/// items may be eliminated by a cross-crate used-set — the used-set records a downstream binary's
+/// calls into this crate's externally-nameable surface and cannot speak to `pub(crate)`/private
+/// items (which are kept by the intra-crate BFS instead). Non-local items are conservatively
+/// treated as externally reachable.
+fn is_externally_reachable(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    match def_id.as_local() {
+        Some(local) => tcx.effective_visibilities(()).is_exported(local),
+        None => true,
+    }
 }
 
 /// Cheap, local-only safety floor (no monomorphization collection). Rejects items that are

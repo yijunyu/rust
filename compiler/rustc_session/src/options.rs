@@ -2324,6 +2324,13 @@ options! {
         "walk this crate's MIR (no codegen needed) and write per-dependency used-set files \
          into this directory: the extern fns it reaches, for cross-crate dead-fn elimination \
          (experimental)"),
+    dead_fn_probe_done: Option<PathBuf> = (None, parse_opt_pathbuf, [UNTRACKED],
+        "after emitting used-sets, append a line to this barrier file to register that this \
+         probe has finished (paired with -Zdead-fn-await-probes) (experimental)"),
+    dead_fn_await_probes: Option<String> = (None, parse_opt_string, [UNTRACKED],
+        "`<path>:<N>`: before reading the used-set, block until the barrier file <path> has N \
+         lines — i.e. all N probes have finished appending — so the used-set is complete \
+         (experimental)"),
     debug_info_type_line_numbers: bool = (false, parse_bool, [TRACKED],
         "emit type and line information for additional data types (default: no)"),
     debuginfo_compression: DebugInfoCompression = (DebugInfoCompression::None, parse_debuginfo_compression, [TRACKED],

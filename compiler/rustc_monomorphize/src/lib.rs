@@ -60,5 +60,15 @@ pub fn provide(providers: &mut Providers) {
 pub fn emit_used_set_if_requested(tcx: TyCtxt<'_>) {
     if let Some(dir) = &tcx.sess.opts.unstable_opts.dead_fn_emit_used_set {
         used_set::emit_used_sets(tcx, dir);
+        // Register this probe as done in the completeness barrier, so consumers waiting on
+        // `-Zdead-fn-await-probes` know all appends to the used-sets have landed. Append one line
+        // (content irrelevant; consumers count lines). Best-effort: a failure just means a
+        // consumer may fall back to its wait-timeout.
+        if let Some(done) = &tcx.sess.opts.unstable_opts.dead_fn_probe_done {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(done) {
+                let _ = writeln!(f, "done");
+            }
+        }
     }
 }
